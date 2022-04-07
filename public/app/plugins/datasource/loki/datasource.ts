@@ -33,18 +33,15 @@ import {
   ScopedVars,
   TimeRange,
   rangeUtil,
+  MutableDataFrame,
+  toUtc,
 } from '@grafana/data';
 import { BackendSrvRequest, FetchError, getBackendSrv, config, DataSourceWithBackend } from '@grafana/runtime';
 import { getTemplateSrv, TemplateSrv } from 'app/features/templating/template_srv';
 import { addLabelToQuery } from './add_label_to_query';
 import { getTimeSrv, TimeSrv } from 'app/features/dashboard/services/TimeSrv';
 import { convertToWebSocketUrl } from 'app/core/utils/explore';
-import {
-  lokiResultsToTableModel,
-  lokiStreamsToDataFrames,
-  lokiStreamsToRawDataFrame,
-  processRangeQueryResponse,
-} from './result_transformer';
+import { lokiResultsToTableModel, lokiStreamsToDataFrames, processRangeQueryResponse } from './result_transformer';
 import { transformBackendResult } from './backendResultTransformer';
 import { addParsedLabelToQuery, getNormalizedLokiQuery, queryHasPipeParser } from './query_utils';
 
@@ -75,7 +72,6 @@ const RANGE_QUERY_ENDPOINT = `${LOKI_ENDPOINT}/query_range`;
 const INSTANT_QUERY_ENDPOINT = `${LOKI_ENDPOINT}/query`;
 
 const DEFAULT_QUERY_PARAMS: Partial<LokiRangeQueryRequest> = {
-  direction: 'BACKWARD',
   limit: DEFAULT_MAX_LINES,
   query: '',
 };
@@ -229,6 +225,7 @@ export class LokiDatasource
       query: target.expr,
       time: `${timeNs + (1e9 - (timeNs % 1e9))}`,
       limit: Math.min(queryLimit || Infinity, this.maxLines),
+      direction: target.forward ? 'FORWARD' : 'BACKWARD',
     };
 
     /** Used only for results of metrics instant queries */
@@ -288,6 +285,7 @@ export class LokiDatasource
       ...range,
       query,
       limit,
+      direction: target.forward ? 'FORWARD' : 'BACKWARD',
     };
   }
 
@@ -536,15 +534,33 @@ export class LokiDatasource
   }
 
   getLogRowContext = (row: LogRowModel, options?: RowContextOptions): Promise<{ data: DataFrame[] }> => {
-    const target = this.prepareLogRowContextQueryTarget(
-      row,
-      (options && options.limit) || 10,
-      (options && options.direction) || 'BACKWARD'
-    );
+    const direction = (options && options.direction) || 'BACKWARD';
+    const { query, range } = this.prepareLogRowContextQueryTarget(row, (options && options.limit) || 10, direction);
 
-    const reverse = options && options.direction === 'FORWARD';
+    const reverseResultIfNeeded = (result: DataQueryResponse): DataQueryResponse => {
+      if (direction === 'BACKWARD') {
+        return result;
+      }
+
+      // direction === FORWARD
+
+      return {
+        ...result,
+        data: result.data.map((frame) => {
+          const reversedFrame = new MutableDataFrame(frame);
+          reversedFrame.reverse();
+          return reversedFrame;
+        }),
+      };
+
+      return result;
+    };
+
+    // i think this can only be called from explore currently
+    const app = CoreApp.Explore;
+
     return lastValueFrom(
-      this._request(RANGE_QUERY_ENDPOINT, target).pipe(
+      this._querySingle(query, range, app, 'FIXME').pipe(
         catchError((err) => {
           const error: DataQueryError = {
             message: 'Error during context query. Please check JS console logs.',
@@ -553,18 +569,18 @@ export class LokiDatasource
           };
           throw error;
         }),
-        switchMap((res) =>
-          of({
-            data: res.data ? [lokiStreamsToRawDataFrame(res.data.data.result, reverse)] : [],
-          })
-        )
+        switchMap((res) => of(reverseResultIfNeeded(res)))
       )
     );
   };
 
-  prepareLogRowContextQueryTarget = (row: LogRowModel, limit: number, direction: 'BACKWARD' | 'FORWARD') => {
+  prepareLogRowContextQueryTarget = (
+    row: LogRowModel,
+    limit: number,
+    direction: 'BACKWARD' | 'FORWARD'
+  ): { query: LokiQuery; range: TimeRange } => {
     const labels = this.languageProvider.getLabelKeys();
-    const query = Object.keys(row.labels)
+    const expr = Object.keys(row.labels)
       .map((label: string) => {
         if (labels.includes(label)) {
           // escape backslashes in label as users can't escape them by themselves
@@ -577,36 +593,48 @@ export class LokiDatasource
       .join(',');
 
     const contextTimeBuffer = 2 * 60 * 60 * 1000; // 2h buffer
-    const commonTargetOptions = {
-      limit,
-      query: `{${query}}`,
-      expr: `{${query}}`,
-      direction,
+
+    const forward = direction === 'FORWARD';
+
+    const query: LokiQuery = {
+      expr: `{${expr}}`,
+      queryType: LokiQueryType.Range,
+      refId: '',
+      maxLines: limit,
+      forward,
     };
 
     const fieldCache = new FieldCache(row.dataFrame);
-    const nsField = fieldCache.getFieldByName('tsNs')!;
-    const nsTimestamp = nsField.values.get(row.rowIndex);
-
-    if (direction === 'BACKWARD') {
-      return {
-        ...commonTargetOptions,
-        // convert to ns, we loose some precision here but it is not that important at the far points of the context
-        start: row.timeEpochMs - contextTimeBuffer + '000000',
-        end: nsTimestamp,
-        direction,
-      };
-    } else {
-      return {
-        ...commonTargetOptions,
-        // start param in Loki API is inclusive so we'll have to filter out the row that this request is based from
-        // and any other that were logged in the same ns but before the row. Right now these rows will be lost
-        // because the are before but came it he response that should return only rows after.
-        start: nsTimestamp,
-        // convert to ns, we loose some precision here but it is not that important at the far points of the context
-        end: row.timeEpochMs + contextTimeBuffer + '000000',
-      };
+    const tsField = fieldCache.getFirstFieldOfType(FieldType.time);
+    if (tsField === undefined) {
+      throw new Error('loki: dataframe missing time-field, should never happen');
     }
+    const tsValue = tsField.values.get(row.rowIndex);
+    const timestamp = toUtc(tsValue);
+
+    const range = forward
+      ? {
+          // start param in Loki API is inclusive so we'll have to filter out the row that this request is based from
+          // and any other that were logged in the same ns but before the row. Right now these rows will be lost
+          // because the are before but came it he response that should return only rows after.
+          from: timestamp,
+          // convert to ns, we loose some precision here but it is not that important at the far points of the context
+          to: toUtc(row.timeEpochMs + contextTimeBuffer),
+        }
+      : {
+          // convert to ns, we loose some precision here but it is not that important at the far points of the context
+          from: toUtc(row.timeEpochMs - contextTimeBuffer),
+          to: timestamp,
+        };
+
+    return {
+      query,
+      range: {
+        from: range.from,
+        to: range.to,
+        raw: range,
+      },
+    };
   };
 
   testDatasource() {
