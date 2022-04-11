@@ -29,6 +29,7 @@ load(
     'validate_scuemata_step',
     'ensure_cuetsified_step',
     'test_a11y_frontend_step',
+    'store_storybook_step',
 )
 
 load(
@@ -105,6 +106,7 @@ def pr_pipelines(edition):
         e2e_tests_step('various-suite', edition=edition),
         e2e_tests_artifacts(edition=edition),
         build_storybook_step(edition=edition, ver_mode=ver_mode),
+        store_storybook_step(edition=edition, ver_mode=ver_mode),
         test_a11y_frontend_step(ver_mode=ver_mode, edition=edition),
         copy_packages_for_docker_step(),
         build_docker_images_step(edition=edition, ver_mode=ver_mode, archs=['amd64',]),

@@ -1,6 +1,6 @@
 load('scripts/drone/vault.star', 'from_secret', 'github_token', 'pull_secret', 'drone_token', 'prerelease_bucket')
 
-grabpl_version = 'v2.9.32'
+grabpl_version = 'test-store-storybook'
 build_image = 'grafana/build-container:1.5.3'
 publish_image = 'grafana/grafana-ci-deploy:1.3.1'
 deploy_docker_image = 'us.gcr.io/kubernetes-dev/drone/plugins/deploy-image'
@@ -280,7 +280,7 @@ def store_storybook_step(edition, ver_mode, trigger=None):
         'image': publish_image,
         'depends_on': ['build-storybook',] + end_to_end_tests_deps(edition),
         'environment': {
-            'GCP_KEY': from_secret('gcp_key'),
+            'GCP_KEY': from_secret('gcp_key_temp'),
             'PRERELEASE_BUCKET': from_secret(prerelease_bucket)
         },
         'commands': commands,
