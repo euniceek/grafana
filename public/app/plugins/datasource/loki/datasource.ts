@@ -32,6 +32,7 @@ import {
   QueryResultMeta,
   ScopedVars,
   TimeRange,
+  rangeUtil,
 } from '@grafana/data';
 import { BackendSrvRequest, FetchError, getBackendSrv, config, DataSourceWithBackend } from '@grafana/runtime';
 import { getTemplateSrv, TemplateSrv } from 'app/features/templating/template_srv';
@@ -144,6 +145,24 @@ export class LokiDatasource
       range: request.range,
       targets: request.targets,
     });
+  }
+
+  // sometimes we need to run a loki query where we only have a LokiQuery object
+  _querySingle(query: LokiQuery, range: TimeRange, app: CoreApp, requestId: string): Observable<DataQueryResponse> {
+    const intervalinfo = rangeUtil.calculateInterval(range, 1);
+    const request: DataQueryRequest<LokiQuery> = {
+      targets: [query],
+      requestId,
+      interval: intervalinfo.interval,
+      intervalMs: intervalinfo.intervalMs,
+      range: range,
+      scopedVars: {},
+      timezone: 'UTC',
+      app,
+      startTime: Date.now(),
+    };
+
+    return this.query(request);
   }
 
   query(request: DataQueryRequest<LokiQuery>): Observable<DataQueryResponse> {
@@ -632,32 +651,21 @@ export class LokiDatasource
   }
 
   async annotationQuery(options: any): Promise<AnnotationEvent[]> {
-    const {
-      expr,
-      maxLines,
-      instant,
-      stepInterval,
-      tagKeys = '',
-      titleFormat = '',
-      textFormat = '',
-    } = options.annotation;
+    const { expr, maxLines, instant, tagKeys = '', titleFormat = '', textFormat = '' } = options.annotation;
 
     if (!expr) {
       return [];
     }
 
-    const interpolatedExpr = this.templateSrv.replace(expr, {}, this.interpolateQueryExpr);
-    const query = {
+    const query: LokiQuery = {
       refId: `annotation-${options.annotation.name}`,
-      expr: interpolatedExpr,
+      expr,
       maxLines,
       instant,
-      stepInterval,
       queryType: instant ? LokiQueryType.Instant : LokiQueryType.Range,
     };
-    const { data } = instant
-      ? await lastValueFrom(this.runInstantQuery(query, options as any))
-      : await lastValueFrom(this.runRangeQuery(query, options as any));
+
+    const { data } = await lastValueFrom(this._querySingle(query, options.range, CoreApp.Dashboard, 'FIXME'));
 
     const annotations: AnnotationEvent[] = [];
     const splitKeys: string[] = tagKeys.split(',').filter((v: string) => v !== '');
